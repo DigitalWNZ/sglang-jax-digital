@@ -817,7 +817,7 @@ class ModelRunner(BaseModelRunner):
         # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
         # - Find total # of tokens available across layers.
         # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-        total_tokens = self.max_total_num_tokens * self.adjust_layer_num()
+        total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
