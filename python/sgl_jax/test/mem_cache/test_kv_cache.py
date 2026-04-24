@@ -178,6 +178,8 @@ class TestKVCache(unittest.TestCase):
 
         # Make all tokens padding
         loc = jnp.full((total_tokens,), -1, dtype=jnp.int32)
+        loc_sharding = NamedSharding(mesh, P("data"))
+        loc = jax.device_put(loc, loc_sharding)
 
         original_cache = kv_cache.copy()
 
@@ -243,8 +245,6 @@ class TestKVCache(unittest.TestCase):
                     self.assertTrue(
                         jnp.allclose(updated_k[30 + i, :, : self.head_dim], k[11 + i], rtol=1e-5)
                     )
-
-                print(f"  ✓ page_size={page_size} passed")
 
 
 if __name__ == "__main__":

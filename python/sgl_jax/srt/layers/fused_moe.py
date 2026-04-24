@@ -216,6 +216,9 @@ class FusedEPMoE(nnx.Module):
         with jax.set_mesh(self.mesh):
             if is_static:
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
+                # Keep a shardable placeholder shape for static checkpoints.
+                # Axis 0 is sharded by ("data", "tensor"), so it must be divisible by EP mesh size.
+                ep_scale_placeholder_shape = (self.num_experts, 1, 1, 1)
 
                 # Scale placeholder shapes are (E, K//block_k, 1, N) for both
                 # 1D sub-channel and 2D block-wise quantization.  In the 2D case,
@@ -505,5 +508,5 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
         return output

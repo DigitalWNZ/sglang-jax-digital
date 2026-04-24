@@ -258,13 +258,16 @@ class MHATokenToKVPool(KVCache):
         head_dim: int,
         layer_num: int,
         mesh: Mesh,
+        dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.head_num = head_num
         self.head_dim = head_dim
+        self.dp_size = dp_size
         self.kv_partition_axis = "tensor"
+        self.attention_data_partition_axis = "data"
 
         self._create_buffers()
         self._calculate_memory_usage()
@@ -315,31 +318,30 @@ class MHATokenToKVPool(KVCache):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(
             self.mesh,
-            P(None, None, self.kv_partition_axis, None, None),
+            P(self.attention_data_partition_axis, None, self.kv_partition_axis, None, None),
         )
 
         logger.info("Creating fused KV buffers for %s layers", self.layer_num)
         start_time = time.time()
 
+        assert self.size % self.dp_size == 0, "Cache size must be divisible by dp_size"
         assert (
             self.size % self.page_size == 0
-        ), "Cache size must be divisible by dp_size and size must be divisible by page size"
+        ), "Cache size must be divisible by page size"
 
         # Hack: this shape is more friendly to rpav3
         packing = get_dtype_packing(self.dtype)
         fused_buffer_shape = (
-            (self.size + self.page_size) // self.page_size,
+            (self.size + self.page_size * self.dp_size) // self.page_size,
             self.page_size,
             self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
             packing,
             self.head_dim,
         )
-        total_memory_per_layer = (
-            fused_buffer_shape[0]
-            * fused_buffer_shape[1]
-            * fused_buffer_shape[2]
-            * jnp.dtype(self.dtype).itemsize
-        )
+        total_memory_per_layer = 1
+        for dim in fused_buffer_shape:
+            total_memory_per_layer *= dim
+        total_memory_per_layer *= jnp.dtype(self.dtype).itemsize
         logger.info(
             "Total fused KV cache memory per layer: %.2f GB, dtype: %s",
             total_memory_per_layer / GB,
@@ -368,7 +370,7 @@ class MHATokenToKVPool(KVCache):
     def _calculate_memory_usage(self):
         """Calculate memory usage for fused KV cache"""
         fused_kv_size = (
-            (self.size + self.page_size)
+            (self.size + self.page_size * self.dp_size)
             * self.head_num  # num_kv_heads
             * self.head_dim
             * 2  # num_heads * 2 (head interleaving)
@@ -386,7 +388,7 @@ class MHATokenToKVPool(KVCache):
     def get_kv_size_bytes(self):
         """Calculate KV cache size in bytes for fused format"""
         fused_kv_size = (
-            (self.size + self.page_size)
+            (self.size + self.page_size * self.dp_size)
             * self.head_num  # num_kv_heads
             * self.head_dim
             * 2  # num_heads * 2 (head interleaving)
@@ -436,7 +438,7 @@ class MHATokenToKVPool(KVCache):
             kv_cache=self.kv_buffer[layer_idx],
             page_size=page_size,
             kv_partition_axis=self.kv_partition_axis,
-            attention_data_partition_axis=None,
+            attention_data_partition_axis=self.attention_data_partition_axis,
             mesh=self.mesh,
         )
 
@@ -682,7 +684,7 @@ def _set_fused_kv_buffer(
     kv_cache: jax.Array,
     page_size: int,
     kv_partition_axis: str = "tensor",
-    attention_data_partition_axis: str = None,
+    attention_data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
     """
@@ -715,7 +717,7 @@ def update_fused_kv_cache(
     kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
     page_size: int = 1,
     kv_partition_axis: str = "tensor",
-    data_partition_axis: str = None,
+    data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
     """
@@ -769,6 +771,7 @@ def update_kv_cache_vectorized(
     # Use original logic for page_size = 1: one slice per token
     kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
     new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
+    new_kv_locs = jax.sharding.reshard(new_kv_locs, loc.sharding)
     slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
     num_slices = total_tokens
 
@@ -817,7 +820,7 @@ def update_fused_kv_cache_vectorized(
     kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
     page_size: int,
     kv_partition_axis: str = "tensor",
-    data_partition_axis: str = None,
+    data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
     """
