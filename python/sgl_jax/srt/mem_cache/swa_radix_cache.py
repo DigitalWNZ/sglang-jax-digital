@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class TreeNode:
+
     counter = 0
     swa_uuid_counter = 1
 
@@ -263,10 +264,10 @@ class LRUList:
                 x_lru = getattr(x, self.prv)
 
             if self.swa:
-                evictable_size = tree_cache.swa_evictable_size()
+                evictable_size = sum(tree_cache.swa_evictable_size_.values())
                 lru_list_evictable_size = tree_cache.swa_lru_list_evictable_size()
             else:
-                evictable_size = tree_cache.full_evictable_size()
+                evictable_size = sum(tree_cache.full_evictable_size_.values())
                 lru_list_evictable_size = tree_cache.full_lru_list_evictable_size()
 
             assert (
@@ -424,7 +425,8 @@ class SWARadixCache(BasePrefixCache):
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(req.fill_ids)]
 
-            req.prefix_indices = kv_indices.copy()
+            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            req.prefix_indices = kv_indices
             return
 
         token_ids = req.fill_ids
@@ -713,12 +715,6 @@ class SWARadixCache(BasePrefixCache):
     def swa_protected_size(self, dp_rank: int = 0) -> int:
         # protected size refers to the size of the swa cache that is locked
         return self.swa_protected_size_[dp_rank]
-
-    def adjust_swa_protected_size(self, delta: int):
-        """Adjust swa_protected_size_ by delta (can be negative)."""
-        if self.disable:
-            return
-        self.swa_protected_size_ += delta
 
     def all_values_flatten(self) -> jnp.Array:
         values = []

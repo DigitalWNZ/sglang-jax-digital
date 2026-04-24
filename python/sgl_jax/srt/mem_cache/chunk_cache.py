@@ -45,9 +45,14 @@ class ChunkCache(BasePrefixCache):
     def cache_unfinished_req(self, req: Req):
         req.prefix_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
-        ].copy()
+        ]
 
-    def evict(self, num_tokens: int, dp_rank: int | None = None):
+    def evict(
+        self,
+        num_tokens: int,
+        swa_num_tokens: int = 0,
+        dp_rank: int | None = None,
+    ):
         pass
 
     def inc_lock_ref(self, node: Any):
