@@ -183,9 +183,16 @@ class ModelWorker:
 
         assert self.max_running_requests > 0, "max_running_request is zero"
 
+        # A single request lives on one DP rank, so max_req_len is bounded
+        # by per-rank pool size, not the global (dp-scaled) pool size.
+        per_rank_tokens = (
+            self.max_total_num_tokens // self.dp_size
+            if self.dp_size > 1
+            else self.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+            per_rank_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
@@ -392,7 +399,7 @@ class ModelWorker:
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
-            self.worker.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
         )
 
     def get_max_padded_size(self):
@@ -533,8 +540,8 @@ class ModelWorker:
 
     def get_tokens_per_layer_info(self):
         return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
+            getattr(self.model_runner, "full_max_total_num_tokens", self.model_runner.max_total_num_tokens),
+            getattr(self.model_runner, "swa_max_total_num_tokens", self.model_runner.max_total_num_tokens),
         )
 
     def get_pad_input_ids_func(self):
@@ -583,7 +590,7 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
-            forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+            forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
 
@@ -760,9 +767,13 @@ class MockModelWorker:
             self.model_runner.req_to_token_pool.size,
         )
         assert self.max_running_requests > 0, "max_running_request is zero"
+        dp_size = server_args.dp_size
+        per_rank_tokens = (
+            self.max_total_num_tokens // dp_size if dp_size > 1 else self.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+            per_rank_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"

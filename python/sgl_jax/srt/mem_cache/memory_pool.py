@@ -19,27 +19,15 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
-    """Merge 3D k/v into 5D fused format matching KV cache shape.
-
-    Input:  k, v: [num_tokens, num_kv_heads, head_dim]
-    Output: [num_tokens, 1, num_kv_heads * 2 // packing, packing, head_dim_aligned]
-    """
     assert k.shape == v.shape, f"k and v must have same shape, got {k.shape} vs {v.shape}"
 
     num_tokens, num_kv_heads, head_dim = k.shape
 
+    kv_stacked = jnp.stack([k, v], axis=2)  # [tokens, heads, 2, head_dim]
+    kv_fused = kv_stacked.reshape(num_tokens, num_kv_heads * 2, head_dim)
     from sgl_jax.srt.kernels.ragged_paged_attention.util import align_to
 
-    packing = get_dtype_packing(k.dtype)
-    num_kv_heads_x2 = num_kv_heads * 2
     head_dim_aligned = align_to(head_dim, 128)
-
-    # Interleave k and v: [tokens, heads, 2, head_dim] -> [tokens, heads*2, head_dim]
-    kv_stacked = jnp.stack([k, v], axis=2)
-    kv_fused = kv_stacked.reshape(num_tokens, num_kv_heads_x2, head_dim)
-
-    # Pad head_dim to aligned size, then reshape to 5D step by step
-    # (each step only splits one axis to avoid JAX ShardingTypeError)
     kv_fused = jnp.pad(
         kv_fused,
         (
@@ -48,11 +36,11 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
             (0, head_dim_aligned - head_dim),
         ),
         constant_values=0,
+    ).reshape(
+        num_tokens,
+        num_kv_heads * 2,
+        head_dim_aligned,
     )
-    # Step 1: [tokens, heads*2, hdim] -> [tokens, heads*2//packing, packing, hdim]
-    kv_fused = kv_fused.reshape(num_tokens, num_kv_heads_x2 // packing, packing, head_dim_aligned)
-    # Step 2: [tokens, h, packing, hdim] -> [tokens, 1, h, packing, hdim]
-    kv_fused = jnp.expand_dims(kv_fused, axis=1)
     return kv_fused
 
 
@@ -280,7 +268,9 @@ class MHATokenToKVPool(KVCache):
             **parent_aux_data,
             "head_num": self.head_num,
             "head_dim": self.head_dim,
+            "dp_size": self.dp_size,
             "kv_partition_axis": self.kv_partition_axis,
+            "attention_data_partition_axis": self.attention_data_partition_axis,
             "kv_sharding": self.kv_sharding,
         }
         return (children, aux_data)
@@ -307,7 +297,9 @@ class MHATokenToKVPool(KVCache):
 
         obj.head_num = aux_data["head_num"]
         obj.head_dim = aux_data["head_dim"]
+        obj.dp_size = aux_data.get("dp_size", 1)
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.attention_data_partition_axis = aux_data.get("attention_data_partition_axis", "data")
         obj.kv_sharding = aux_data["kv_sharding"]
 
         obj.kv_buffer = kv_buffer
@@ -324,27 +316,26 @@ class MHATokenToKVPool(KVCache):
         logger.info("Creating fused KV buffers for %s layers", self.layer_num)
         start_time = time.time()
 
-        assert self.size % self.dp_size == 0, "Cache size must be divisible by dp_size"
         assert (
-            self.size % self.page_size == 0
-        ), "Cache size must be divisible by page size"
+            self.size % self.dp_size == 0 and self.size % self.page_size == 0
+        ), "Cache size must be divisible by dp_size and size must be divisible by page size"
 
         # Hack: this shape is more friendly to rpav3
         packing = get_dtype_packing(self.dtype)
-        total_pages = (self.size + self.page_size * self.dp_size) // self.page_size
-        # Round up to nearest multiple of dp_size so dim 0 is shardable across DP ranks
-        total_pages = ((total_pages + self.dp_size - 1) // self.dp_size) * self.dp_size
         fused_buffer_shape = (
-            total_pages,
+            (self.size + self.page_size * self.dp_size) // self.page_size,
             self.page_size,
             self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
             packing,
             self.head_dim,
         )
-        total_memory_per_layer = 1
-        for dim in fused_buffer_shape:
-            total_memory_per_layer *= dim
-        total_memory_per_layer *= jnp.dtype(self.dtype).itemsize
+        print(f"{fused_buffer_shape=}")
+        total_memory_per_layer = (
+            fused_buffer_shape[0]
+            * fused_buffer_shape[1]
+            * fused_buffer_shape[2]
+            * jnp.dtype(self.dtype).itemsize
+        )
         logger.info(
             "Total fused KV cache memory per layer: %.2f GB, dtype: %s",
             total_memory_per_layer / GB,
@@ -406,8 +397,15 @@ class MHATokenToKVPool(KVCache):
     def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         return self.kv_buffer[layer_id - self.start_layer]
 
-    def get_kv_buffer(self, layer_id: int) -> jax.Array:
-        return self.kv_buffer[layer_id - self.start_layer]
+    def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
+        layer_idx = layer_id - self.start_layer
+        fused_kv = self.kv_buffer[layer_idx]  # [cache_size, num_kv_heads * 2, head_dim]
+
+        # Extract K and V from head interleaving format [K1,V1,K2,V2,...]
+        k_buffer = fused_kv[:, ::2, :]  # Even indices: K heads (0, 2, 4, ...)
+        v_buffer = fused_kv[:, 1::2, :]  # Odd indices: V heads (1, 3, 5, ...)
+
+        return k_buffer, v_buffer
 
     def set_kv_buffer(
         self,
@@ -483,39 +481,15 @@ class MHATokenToKVPool(KVCache):
         """
         Legacy interface for backward compatibility.
         This assumes contiguous cache locations and uses simple JAX operations.
-
-        Returns:
-            Updated 5D fused KV cache buffer.
         """
         layer_idx = layer_id - self.start_layer
+        # Merge k and v into fused format
         fused_kv = merge_kv(cache_k, cache_v)
-
-        # Flatten both 5D -> 3D for token-level scatter, since loc contains flat token indices
-        cache_5d = self.kv_buffer[layer_idx]
-        num_pages, page_size, heads_x2_per_pack, packing, head_dim = cache_5d.shape
-        total_cache_tokens = num_pages * page_size
-        cache_3d = jax.lax.reshape(
-            cache_5d,
-            (total_cache_tokens, heads_x2_per_pack * packing, head_dim),
-            out_sharding=P(None, self.kv_partition_axis, None),
-        )
-
-        num_tokens, _one, fkv_h, fkv_p, fkv_d = fused_kv.shape
-        fused_kv_3d = jax.lax.reshape(
-            fused_kv,
-            (num_tokens, fkv_h * fkv_p, fkv_d),
-            out_sharding=P(None, self.kv_partition_axis, None),
-        )
-
-        safe_loc = jnp.where(loc >= 0, loc, jnp.int32(total_cache_tokens))
-        updated_3d = cache_3d.at[safe_loc].set(fused_kv_3d, mode="drop")
-
-        # Reshape back to 5D
-        return jax.lax.reshape(
-            updated_3d,
-            (num_pages, page_size, heads_x2_per_pack, packing, head_dim),
-            out_sharding=P(None, None, self.kv_partition_axis, None, None),
-        )
+        N = self.kv_buffer[layer_idx].shape[0]
+        safe_loc = jnp.where(loc >= 0, loc, jnp.int32(N))
+        # for jax function
+        updated_layer = self.kv_buffer[layer_idx].at[safe_loc].set(fused_kv, mode="drop")
+        return updated_layer
 
 
 @register_pytree_node_class
@@ -526,6 +500,7 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
+        page_size: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
@@ -534,17 +509,18 @@ class SWAKVPool(KVCache):
     ):
         self.size = size
         self.size_swa = size_swa
+        self.page_size = page_size
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.mesh = kwargs["mesh"]
+        self.dp_size = kwargs.get("dp_size", 1)
         self.kv_partition_axis = "tensor"
+        kwargs["page_size"] = page_size
 
-        # If SWA layers have different KV head count, create separate kwargs
-        if swa_head_num is not None and swa_head_num != kwargs.get("head_num"):
-            swa_kwargs = dict(kwargs)
-            swa_kwargs["head_num"] = swa_head_num
-        else:
-            swa_kwargs = kwargs
+        # SWA layers may have different KV head count than full-attention layers
+        swa_kwargs = kwargs
+        if swa_head_num is not None:
+            swa_kwargs = {**kwargs, "head_num": swa_head_num}
 
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
@@ -573,11 +549,9 @@ class SWAKVPool(KVCache):
         self.mem_usage = (k_size + v_size) / GB
 
     def tree_flatten(self):
-        children = (
-            self.swa_kv_pool,
-            self.full_kv_pool,
-            self.full_to_swa_index_mapping,
-        )
+        mapping = self.full_to_swa_index_mapping
+        mapping_children = tuple(mapping) if isinstance(mapping, list) else (mapping,)
+        children = (self.swa_kv_pool, self.full_kv_pool) + mapping_children
         aux_data = {
             "size": self.size,
             "size_swa": self.size_swa,
@@ -585,6 +559,9 @@ class SWAKVPool(KVCache):
             "full_layer_nums": self.full_layer_nums,
             "layers_mapping": self.layers_mapping,
             "mem_usage": self.mem_usage,
+            "dp_size": self.dp_size,
+            "page_size": self.page_size,
+            "mapping_count": len(mapping_children),
         }
         return (children, aux_data)
 
@@ -598,10 +575,17 @@ class SWAKVPool(KVCache):
         obj.full_layer_nums = aux_data["full_layer_nums"]
         obj.layers_mapping = aux_data["layers_mapping"]
         obj.mem_usage = aux_data["mem_usage"]
+        obj.dp_size = aux_data.get("dp_size", 1)
+        obj.page_size = aux_data.get("page_size", 1)
 
         obj.swa_kv_pool = children[0]
         obj.full_kv_pool = children[1]
-        obj.full_to_swa_index_mapping = children[2]
+
+        mc = aux_data.get("mapping_count", 1)
+        if mc == 1:
+            obj.full_to_swa_index_mapping = children[2]
+        else:
+            obj.full_to_swa_index_mapping = list(children[2 : 2 + mc])
 
         return obj
 
@@ -622,10 +606,26 @@ class SWAKVPool(KVCache):
             return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
 
-    def _remap_swa_loc(self, loc):
-        """Remap full-pool locations to SWA-pool locations via the index mapping."""
-        mapping = jnp.asarray(self.full_to_swa_index_mapping)
-        return mapping[loc].astype(jnp.int32)
+    def _remap_swa_loc(self, loc: jax.Array) -> jax.Array:
+        """Remap full-pool indices to SWA-pool indices, handling both DP=1 and DP>1.
+
+        In DP>1, full_to_swa_index_mapping is a list of per-rank numpy arrays.
+        We stack them and do per-rank gather via take_along_axis.
+        """
+        mapping = self.full_to_swa_index_mapping
+        if mapping is None:
+            return loc
+        if isinstance(mapping, list):
+            # DP>1: stack per-rank mappings → [dp_size, size_per_rank+1]
+            stacked = jnp.stack([jnp.asarray(m) for m in mapping])
+            tokens_per_rank = loc.shape[0] // self.dp_size
+            loc_2d = loc.reshape(self.dp_size, tokens_per_rank)
+            # Per-rank gather: each rank's loc indexes into its own mapping
+            remapped = jnp.take_along_axis(stacked, loc_2d.astype(jnp.int64), axis=1)
+            return remapped.reshape(-1).astype(jnp.int32)
+        else:
+            # DP=1: simple 1D gather
+            return jnp.asarray(mapping)[loc].astype(jnp.int32)
 
     def set_kv_buffer(
         self,
@@ -637,8 +637,7 @@ class SWAKVPool(KVCache):
     ):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
         if is_swa:
-            if self.full_to_swa_index_mapping is not None:
-                loc = self._remap_swa_loc(loc)
+            loc = self._remap_swa_loc(loc)
             self.swa_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
@@ -673,12 +672,7 @@ class SWAKVPool(KVCache):
         _, is_swa = self.layers_mapping[layer_id]
         if not is_swa:
             return loc
-        if self.full_to_swa_index_mapping is None:
-            # No mapping available yet; return as-is to avoid crash. Caller may handle.
-            return loc
-        # Convert host mapping to jax array and gather
-        mapping_jax = jnp.asarray(self.full_to_swa_index_mapping, dtype=jnp.int32)
-        return mapping_jax[loc]
+        return self._remap_swa_loc(loc)
 
 
 def _set_fused_kv_buffer(
@@ -694,14 +688,14 @@ def _set_fused_kv_buffer(
     Update fused KV cache with new fused KV data.
 
     Args:
-        fused_kv: Fused KV tensor, 5D [tokens, 1, heads//pack, pack, hdim]
+        fused_kv: Fused KV tensor [total_tokens, num_kv_heads * 2, head_dim]
         loc: Location indices [total_tokens], -1 for padding tokens
-        kv_cache: Fused KV cache buffer, 5D [pages, page_size, heads//pack, pack, hdim]
+        kv_cache: Fused KV cache buffer [cache_size, num_kv_heads * 2, head_dim]
         page_size: Page size for vectorized updates
         kv_partition_axis: Partition axis for sharding
 
     Returns:
-        Updated fused KV cache (5D)
+        Updated fused KV cache
     """
     return update_fused_kv_cache(
         fused_kv,
@@ -715,9 +709,9 @@ def _set_fused_kv_buffer(
 
 
 def update_fused_kv_cache(
-    fused_kv: jax.Array,  # [tokens, 1, heads*2//packing, packing, head_dim]
+    fused_kv: jax.Array,  # [total_tokens, num_kv_heads * 2, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
-    kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
+    kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int = 1,
     kv_partition_axis: str = "tensor",
     data_partition_axis: str = "data",
@@ -727,9 +721,9 @@ def update_fused_kv_cache(
     Main fused KV cache update function.
 
     Args:
-        fused_kv: Fused KV tensor, 5D [tokens, 1, heads*2//packing, packing, head_dim]
+        fused_kv: Fused KV tensor [total_tokens, num_kv_heads * 2, head_dim]
         loc: Location indices [total_tokens], -1 for padding tokens
-        kv_cache: Fused KV cache buffer, 5D [num_pages, page_size, heads*2//packing, packing, head_dim]
+        kv_cache: Fused KV cache buffer
         page_size: Page size for vectorized updates
         kv_partition_axis: Partition axis for sharding
 
@@ -818,9 +812,9 @@ def update_kv_cache_vectorized(
 
 
 def update_fused_kv_cache_vectorized(
-    fused_kv: jax.Array,  # [tokens, 1, heads*2//packing, packing, head_dim]
+    fused_kv: jax.Array,  # [total_tokens, num_kv_heads * 2, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
-    kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
+    kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int,
     kv_partition_axis: str = "tensor",
     data_partition_axis: str = "data",
@@ -833,18 +827,20 @@ def update_fused_kv_cache_vectorized(
 
     @jax.shard_map(
         in_specs=(
-            # fused_kv: 5D sharded by data and tensor
-            P(data_partition_axis, None, kv_partition_axis, None, None),
+            # fused_kv: sharded by data (tokens) and tensor (heads)
+            P(data_partition_axis, kv_partition_axis, None),
             # loc: sharded by data
             P(data_partition_axis),
-            # kv_cache: 5D sharded by data and tensor
-            P(data_partition_axis, None, kv_partition_axis, None, None),
+            # kv_cache: sharded by data and tensor
+            P(data_partition_axis, kv_partition_axis, None),
         ),
-        out_specs=P(data_partition_axis, None, kv_partition_axis, None, None),
+        out_specs=P(data_partition_axis, kv_partition_axis, None),
         mesh=mesh,
         check_vma=False,
     )
     def _sharded_update(local_fused_kv, local_loc, local_kv_cache):
+        # 1. Compute slices (locally)
+        # We assume local_loc already contains indices local to this shard.
         total_tokens = local_loc.shape[0]
         local_loc_int = local_loc.astype(jnp.int32)
 
@@ -853,8 +849,9 @@ def update_fused_kv_cache_vectorized(
         slice_lens = jnp.where(local_loc_int == -1, 0, 1).astype(jnp.int32)
         num_slices = total_tokens
 
+        # head_num, cache_len, new_kv_len, head_dim (fused), page_size
         num_slices_per_block = get_num_slices_per_block(
-            local_fused_kv,
+            local_fused_kv,  # num_kv_heads
             local_kv_cache,
             page_size,
         )
@@ -868,6 +865,7 @@ def update_fused_kv_cache_vectorized(
 
         num_kv_update_slices = jnp.array([num_slices], dtype=jnp.int32)
 
+        # 2. Call kernel implementation directly
         return kv_cache_update_impl(
             new_kv=local_fused_kv,
             slices=slot_mapping,

@@ -156,8 +156,6 @@ class ModelRunner(BaseModelRunner):
             self.init_lora_manager()
 
         if not self.is_draft_worker:
-            self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-            self._sampler_step = 0
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -229,27 +227,18 @@ class ModelRunner(BaseModelRunner):
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, token_to_kv_pool, logits_metadata)
 
-        # Capture base RNG key as a constant in the JIT closure.
-        # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
-        # the eager jax.random.split that would serialize the host-device pipeline.
-        base_rng_key = self._sampler_base_rng
-
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
             use_sort_for_toppk_minp,
-            rng_step,
             *args,
         ):
 
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
-            return sampler(
-                *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
-            )
+            return sampler(*args, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
 
         @partial(jax.jit, static_argnames=["mesh"])
         def jitted_compute_logprobs(mesh, logits, next_tokens):
@@ -377,28 +366,6 @@ class ModelRunner(BaseModelRunner):
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
-    def adjust_layer_num(self):
-        """For hybrid models, compute effective layer count accounting for
-        SWA layers having potentially different KV head counts."""
-        if not self.is_hybrid:
-            return self.model_config.num_hidden_layers
-
-        swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
-        if swa_num_kv_heads is None:
-            return self.model_config.num_hidden_layers
-
-        num_kv_heads = self.model_config.hf_config.num_key_value_heads
-        # Compute SWA vs full layer counts from hybrid_layer_pattern
-        pattern = getattr(self.model_config.hf_config, "hybrid_layer_pattern", None)
-        if pattern is None:
-            return self.model_config.num_hidden_layers
-        swa_layers = sum(1 for p in pattern if p == 1)
-        full_layers = sum(1 for p in pattern if p == 0)
-
-        # Effective layer count weighted by KV head ratio
-        effective = (swa_num_kv_heads / num_kv_heads) * swa_layers + full_layers
-        return effective
-
     def profile_max_num_token(self, total_device_memory: int):
         """
         Profile the maximum number of tokens that can fit in memory.
@@ -413,13 +380,30 @@ class ModelRunner(BaseModelRunner):
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-        head_dim_aligned = self.model_config.head_dim
-        if head_dim_aligned % 128 != 0:
-            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
+
+        # head_dim/v_head_dim handling
+        # V is padded to head_dim in model layer for fused KV cache
+        head_dim = self.model_config.head_dim
+        head_dim_aligned = (head_dim + 127) // 128 * 128
+
+
+        def adjust_layer_num():
+            # 0 for full attention, 1 for swa
+            full,swa=0,0
+            if getattr(self.model_config.hf_text_config, "hybrid_layer_pattern",None):
+                for pattern in self.model_config.hf_text_config.hybrid_layer_pattern:
+                    if pattern==0:
+                        full+=1
+                    elif pattern==1:
+                        swa+=1
+                return (self.model_config.hf_text_config.swa_num_key_value_heads//self.model_config.hf_text_config.num_key_value_heads)*swa+full
+            else:
+                return self.model_config.num_hidden_layers 
+
         cell_size = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * head_dim_aligned
-            * self.adjust_layer_num()
+            * adjust_layer_num()
             * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
         )
@@ -542,24 +526,25 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV cache pool
         if self.is_hybrid:
-            # Compute SWA KV head count (may differ from full attention heads)
-            swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
-            if swa_num_kv_heads is not None:
-                swa_head_num = max(swa_num_kv_heads, self.tp_size)
-            else:
-                swa_head_num = None
+            # SWA layers may have different KV head count
+            swa_head_num = None
+            hf_cfg = self.model_config.hf_text_config
+            if hasattr(hf_cfg, "swa_num_key_value_heads"):
+                swa_head_num = hf_cfg.swa_num_key_value_heads
+
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
+                page_size=self.page_size,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                token_to_kv_pool_class=MHATokenToKVPool,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                page_size=self.page_size,
                 swa_head_num=swa_head_num,
+                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 mesh=self.mesh,
                 dp_size=dp_size,
             )
@@ -579,31 +564,44 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV pool allocator
         if self.token_to_kv_pool_allocator is None:
-            if self.is_hybrid:
-                self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                    self.full_max_total_num_tokens,
-                    self.swa_max_total_num_tokens,
-                    kvcache=self.token_to_kv_pool,
-                    page_size=self.page_size,
-                    dp_size=dp_size,
-                )
-            elif self.page_size == 1:
-                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    kvcache=self.token_to_kv_pool,
-                    dp_size=dp_size,
-                )
+            if self.page_size == 1:
+                if self.is_hybrid:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        kvcache=self.token_to_kv_pool,
+                        page_size=self.page_size,
+                        dp_size=dp_size,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        size=self.max_total_num_tokens,
+                        kvcache=self.token_to_kv_pool,
+                        dp_size=dp_size,
+                    )
             else:
-                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    kvcache=self.token_to_kv_pool,
-                    debug_mode=False,
-                    dp_size=dp_size,
-                )
+                if self.is_hybrid:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        kvcache=self.token_to_kv_pool,
+                        page_size=self.page_size,
+                        dp_size=dp_size,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        kvcache=self.token_to_kv_pool,
+                        debug_mode=False,
+                        dp_size=dp_size,
+                    )
 
-        # Set swa_index_mapping on attention backend for SWA page index computation
-        if self.is_hybrid and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping"):
+        if (
+            self.is_hybrid
+            and hasattr(self, "attn_backend")
+            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+        ):
             object.__setattr__(
                 self.attn_backend,
                 "swa_index_mapping",
@@ -678,6 +676,7 @@ class ModelRunner(BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
+
         self._set_kv_cache_after_forward(layers_kv_fused)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
@@ -764,12 +763,8 @@ class ModelRunner(BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
-        # Advance step counter (pure Python, zero device overhead).
-        # fold_in(base_key, step) inside JIT produces a unique RNG per step.
-        self._sampler_step += 1
         # Penalty application has been moved to the Sampler for better JIT performance
         return self.jitted_sampler(
-            self._sampler_step,
             logits_output,
             sampling_metadata,
         )
@@ -817,6 +812,7 @@ class ModelRunner(BaseModelRunner):
         # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
         # - Find total # of tokens available across layers.
         # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+        # - Account for SWA layers potentially having different KV head count.
         total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
@@ -829,8 +825,9 @@ class ModelRunner(BaseModelRunner):
         self.full_max_total_num_tokens = int(total_tokens / denominator)
         self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
 
-        # Align pool sizes to page_size for correct memory accounting
-        alignment = self.page_size
+        # Align pool sizes to page_size and dp_size for sharding compatibility
+        dp_size = self.server_args.dp_size
+        alignment = self.page_size * dp_size
         self.full_max_total_num_tokens -= self.full_max_total_num_tokens % alignment
         self.swa_max_total_num_tokens -= self.swa_max_total_num_tokens % alignment
 

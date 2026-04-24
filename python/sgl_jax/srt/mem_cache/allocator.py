@@ -406,7 +406,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         size: int,
         size_swa: int,
-        kvcache: "SWAKVPool",
+        kvcache: SWAKVPool,
         page_size: int = 1,
         dp_size: int = 1,
     ):
@@ -414,33 +414,52 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self._page_size = page_size
-        self.page_size = page_size
-        self.is_not_in_free_group = True
-        self.free_group = [[] for _ in range(dp_size)]
 
         if page_size == 1:
-            self.full_attn_allocator = TokenToKVPoolAllocator(size, kvcache.full_kv_pool, dp_size=dp_size)
-            self.swa_attn_allocator = TokenToKVPoolAllocator(size_swa, kvcache.swa_kv_pool, dp_size=dp_size)
+            self.full_attn_allocator = TokenToKVPoolAllocator(
+                size,
+                kvcache.full_kv_pool,
+                dp_size=dp_size,
+            )
+            self.swa_attn_allocator = TokenToKVPoolAllocator(
+                size_swa,
+                kvcache.swa_kv_pool,
+                dp_size=dp_size,
+            )
         else:
             self.full_attn_allocator = PagedTokenToKVPoolAllocator(
-                size=size, page_size=page_size, kvcache=kvcache.full_kv_pool, debug_mode=False, dp_size=dp_size
+                size=size,
+                page_size=page_size,
+                kvcache=kvcache.full_kv_pool,
+                debug_mode=False,
+                dp_size=dp_size,
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
-                size=size_swa, page_size=page_size, kvcache=kvcache.swa_kv_pool, debug_mode=False, dp_size=dp_size
+                size=size_swa,
+                page_size=page_size,
+                kvcache=kvcache.swa_kv_pool,
+                debug_mode=False,
+                dp_size=dp_size,
             )
+        # When page_size > 1, the paged allocator produces token indices up to
+        # pages_per_rank * page_size + page_size - 1 = size_per_rank + page_size - 1,
+        # so the mapping array must be sized accordingly.
+        mapping_size = self.full_attn_allocator.size_per_rank + page_size
+        if dp_size == 1:
+            self.full_to_swa_index_mapping = np.zeros(mapping_size, dtype=np.int32)
+        else:
+            self.full_to_swa_index_mapping = [
+                np.zeros(mapping_size, dtype=np.int32) for _ in range(dp_size)
+            ]
+        self.clear()
 
-        # Mapping from full-pool indices to SWA-pool indices.
-        # Size = size + page_size to handle paged allocator's max index range.
-        # Each rank needs its own mapping since they use local indices [1, size_per_rank]
-        mapping_size = size + page_size
-        self.full_to_swa_index_mapping = [
-            np.zeros(mapping_size, dtype=np.int32) for _ in range(dp_size)
-        ]
-        kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+        self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self, dp_rank: int = 0):
-        return min(self.full_available_size(dp_rank=dp_rank), self.swa_available_size(dp_rank=dp_rank))
+        return min(
+            self.full_attn_allocator.available_size(dp_rank=dp_rank),
+            self.swa_attn_allocator.available_size(dp_rank=dp_rank),
+        )
 
     def full_available_size(self, dp_rank: int = 0):
         return self.full_attn_allocator.available_size(dp_rank=dp_rank)
@@ -465,56 +484,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
-    def alloc_extend(self, prefix_lens, seq_lens, last_loc, extend_num_tokens, dp_rank: int = 0):
-        """Allocate for extend: full and SWA sub-allocators, update mapping."""
-        # Allocate full
-        full_out_cache_loc = self.full_attn_allocator.alloc_extend(
-            prefix_lens, seq_lens, last_loc, extend_num_tokens, dp_rank=dp_rank
-        )
-        if full_out_cache_loc is None:
-            return None
-
-        # Translate last_loc for SWA pool via mapping
-        last_loc_np = np.array(last_loc)
-        swa_last_loc = self.full_to_swa_index_mapping[dp_rank][last_loc_np].astype(np.int32).tolist()
-
-        # Allocate SWA
-        swa_out_cache_loc = self.swa_attn_allocator.alloc_extend(
-            prefix_lens, seq_lens, swa_last_loc, extend_num_tokens, dp_rank=dp_rank
-        )
-        if swa_out_cache_loc is None:
-            # Rollback full allocation
-            self.full_attn_allocator.free(full_out_cache_loc, dp_rank=dp_rank)
-            return None
-
-        # Update mapping
-        self.full_to_swa_index_mapping[dp_rank][full_out_cache_loc] = swa_out_cache_loc
-
-        return full_out_cache_loc
-
-    def alloc_decode(self, seq_lens, last_loc, dp_rank: int = 0):
-        """Allocate for decode: full and SWA sub-allocators, update mapping."""
-        # Allocate full
-        full_out_cache_loc = self.full_attn_allocator.alloc_decode(seq_lens, last_loc, dp_rank=dp_rank)
-        if full_out_cache_loc is None:
-            return None
-
-        # Translate last_loc for SWA pool via mapping
-        last_loc_np = np.array(last_loc)
-        swa_last_loc = self.full_to_swa_index_mapping[dp_rank][last_loc_np].astype(np.int32).tolist()
-
-        # Allocate SWA
-        swa_out_cache_loc = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc, dp_rank=dp_rank)
-        if swa_out_cache_loc is None:
-            # Rollback full allocation
-            self.full_attn_allocator.free(full_out_cache_loc, dp_rank=dp_rank)
-            return None
-
-        # Update mapping
-        self.full_to_swa_index_mapping[dp_rank][full_out_cache_loc] = swa_out_cache_loc
-
-        return full_out_cache_loc
-
     def alloc(self, need_size: int, dp_rank: int = 0):
         if need_size > self.full_attn_allocator.available_size(dp_rank=dp_rank):
             return None
@@ -527,8 +496,71 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # Rollback full allocation if swa allocation fails
             self.full_attn_allocator.free(alloc_full_indices, dp_rank=dp_rank)
             return None
-        self.full_to_swa_index_mapping[dp_rank][alloc_full_indices] = alloc_swa_indices
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
+
+    def alloc_extend(
+        self,
+        prefix_lens: list[int],
+        seq_lens: list[int],
+        last_loc: list[int],
+        extend_num_tokens: int,
+        dp_rank: int = 0,
+    ) -> np.ndarray | None:
+        full_indices = self.full_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, last_loc, extend_num_tokens, dp_rank=dp_rank
+        )
+        if full_indices is None:
+            return None
+
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        last_loc_np = np.array(last_loc)
+        swa_last_loc = mapping[last_loc_np].astype(np.int32).tolist()
+
+        swa_indices = self.swa_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, swa_last_loc, extend_num_tokens, dp_rank=dp_rank
+        )
+        if swa_indices is None:
+            self.full_attn_allocator.free(full_indices, dp_rank=dp_rank)
+            return None
+
+        mapping[full_indices] = swa_indices
+        return full_indices
+
+    def alloc_decode(
+        self,
+        seq_lens: list[int],
+        last_loc: list[int],
+        dp_rank: int = 0,
+    ) -> np.ndarray | None:
+        full_indices = self.full_attn_allocator.alloc_decode(seq_lens, last_loc, dp_rank=dp_rank)
+        if full_indices is None:
+            return None
+
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        last_loc_np = np.array(last_loc)
+        swa_last_loc = mapping[last_loc_np].astype(np.int32).tolist()
+
+        swa_indices = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc, dp_rank=dp_rank)
+        if swa_indices is None:
+            self.full_attn_allocator.free(full_indices, dp_rank=dp_rank)
+            return None
+
+        mapping[full_indices] = swa_indices
+        return full_indices
 
     def free(self, free_index: np.array, dp_rank: int = 0):
         if len(free_index) == 0:
@@ -551,18 +583,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else self.swa_attn_allocator.size
         )
 
-    def free_swa(self, free_index, dp_rank: int = 0):
-        """Free only the SWA pool tokens mapped from the given full-pool indices."""
-        swa_indices = self.full_to_swa_index_mapping[dp_rank][free_index]
-        mask = swa_indices != 0
-        if np.any(mask):
-            self.swa_attn_allocator.free(swa_indices[mask], dp_rank=dp_rank)
-        self.full_to_swa_index_mapping[dp_rank][free_index] = 0
-
-    def count_swa_mapped(self, indices: np.ndarray, dp_rank: int = 0) -> int:
-        """Count how many of the given full indices have an active SWA mapping."""
-        swa_vals = self.full_to_swa_index_mapping[dp_rank][indices]
-        return int(np.count_nonzero(swa_vals))
+    def free_swa(self, free_index: np.array, dp_rank: int = 0):
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        map_vals = mapping[free_index]
+        swa_indices = map_vals[map_vals > 0]
+        self.swa_attn_allocator.free(swa_indices, dp_rank=dp_rank)
+        mapping[free_index] = 0
 
     def backup_state(self):
         raise NotImplementedError
@@ -573,15 +603,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self, dp_rank: int | None = None):
         if dp_rank is None:
             # Clear all ranks
-            self.full_attn_allocator.clear()
             self.swa_attn_allocator.clear()
-            for rank in range(self.dp_size):
-                self.full_to_swa_index_mapping[rank].fill(0)
+            self.full_attn_allocator.clear()
+            if self.dp_size == 1:
+                self.full_to_swa_index_mapping.fill(0)
+            else:
+                for rank in range(self.dp_size):
+                    self.full_to_swa_index_mapping[rank].fill(0)
         else:
             # Clear specific rank
-            self.full_attn_allocator.clear(dp_rank=dp_rank)
             self.swa_attn_allocator.clear(dp_rank=dp_rank)
-            self.full_to_swa_index_mapping[dp_rank].fill(0)
+            self.full_attn_allocator.clear(dp_rank=dp_rank)
+            if self.dp_size == 1:
+                self.full_to_swa_index_mapping.fill(0)
+            else:
+                self.full_to_swa_index_mapping[dp_rank].fill(0)
         self.is_not_in_free_group = True
         self.free_group = [[] for _ in range(self.dp_size)]
 

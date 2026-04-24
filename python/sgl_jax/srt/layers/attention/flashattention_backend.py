@@ -37,20 +37,20 @@ class FlashAttentionMetadata:
     cu_q_lens: jax.Array = None
     cu_kv_lens: jax.Array = None
     page_indices: jax.Array = None
+    swa_page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
-    swa_page_indices: jax.Array = None
 
     def tree_flatten(self):
         children = (
             self.cu_q_lens,
             self.cu_kv_lens,
             self.page_indices,
+            self.swa_page_indices,
             self.seq_lens,
             self.distribution,
             self.custom_mask,
-            self.swa_page_indices,
         )
 
         aux_data = {}
@@ -63,10 +63,10 @@ class FlashAttentionMetadata:
         obj.cu_q_lens = children[0]
         obj.cu_kv_lens = children[1]
         obj.page_indices = children[2]
-        obj.seq_lens = children[3]
-        obj.distribution = children[4]
-        obj.custom_mask = children[5]
-        obj.swa_page_indices = children[6]
+        obj.swa_page_indices = children[3]
+        obj.seq_lens = children[4]
+        obj.distribution = children[5]
+        obj.custom_mask = children[6]
 
         return obj
 
@@ -98,7 +98,8 @@ class FlashAttention(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
-        self.swa_index_mapping = None
+        # SWA dual-pool support: set by model_runner after pool creation.
+        # Accessed on host during metadata construction.
 
     def get_forward_metadata(
         self,
@@ -124,63 +125,35 @@ class FlashAttention(AttentionBackend):
 
         total_loc_len = len(batch.cache_loc)
         per_dp_loc_len = total_loc_len // batch.dp_size
-        page_indices_list = []
-        for i in range(batch.dp_size):
-            # 1. Split: Get the slice for this DP rank
-            start = i * per_dp_loc_len
-            end = (i + 1) * per_dp_loc_len
-            rank_cache_loc = batch.cache_loc[start:end]
-            # 2. Pad: Ensure the rank's data is a multiple of page_size
-            # This ensures that when we stride, we cover the last partial page if it exists,
-            # and the stride for the NEXT rank starts fresh at index 0.
-            remainder = len(rank_cache_loc) % self.page_size
-            if remainder > 0:
-                pad_len = self.page_size - remainder
-                # Pad with 0 (safe dummy slot mapping to page 0)
-                rank_cache_loc = np.concatenate([rank_cache_loc, np.zeros(pad_len, dtype=np.int32)])
 
-            # 3. Select: Sample the start of each page
-            rank_selected_locs = rank_cache_loc[:: self.page_size]
+        # Reshape cache_loc to (dp_size, per_dp_loc_len) — O(1) view
+        cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
+        # Stride by page_size to pick one slot per page — O(1) view
+        strided_2d = cache_loc_2d[:, :: self.page_size]
+        # Physical slot -> Physical page index
+        page_indices = (strided_2d // self.page_size).ravel()
 
-            # 4. Convert: Physical slot -> Physical page index
-            rank_page_indices = (rank_selected_locs // self.page_size).astype(np.int32)
-            page_indices_list.append(rank_page_indices)
-        # 5. Merge: Concatenate all ranks
-        page_indices = np.concatenate(page_indices_list)
-
-        # SWA page indices: apply mapping on ~N_pages entries
-        # instead of ~N_tokens entries (page_size x fewer random accesses)
+        # SWA page indices: stride first, then apply mapping on ~N_pages entries
+        # instead of ~N_tokens entries (256x fewer random accesses)
         swa_page_indices = None
         swa_mapping = getattr(self, "swa_index_mapping", None)
         if swa_mapping is not None:
-            indices = np.arange(0, len(batch.cache_loc), self.page_size)
-            swa_slots = swa_mapping[batch.cache_loc[indices]]
-            swa_page_indices = (swa_slots // self.page_size).astype(np.int32)
+            n_pages = strided_2d.shape[1]
+            swa_strided = np.empty((batch.dp_size, n_pages), dtype=np.int32)
+            for i in range(batch.dp_size):
+                mapping = swa_mapping[i] if isinstance(swa_mapping, list) else swa_mapping
+                swa_strided[i] = mapping[strided_2d[i]]
+            swa_page_indices = (swa_strided // self.page_size).ravel()
 
-        # Compute cu_q_lens per DP rank section (each section starts from 0)
+        # cu_q_lens per DP rank section (each section starts from 0)
         if batch.forward_mode == ForwardMode.EXTEND:
-            cu_q_lens_sections = []
-            for i in range(0, len(batch.extend_seq_lens), batch.per_dp_bs_size):
-                section_lens = batch.extend_seq_lens[i : i + batch.per_dp_bs_size]
-                section_cu = np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(section_lens, dtype=np.int32),
-                    ]
-                )
-                cu_q_lens_sections.append(section_cu)
-            cu_q_lens = np.concatenate(cu_q_lens_sections)
+            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+            cu_q_lens = cu_q_2d.ravel()
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens_sections = []
-            for i in range(0, len(batch.seq_lens), batch.per_dp_bs_size):
-                section_cu = np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(np.ones(batch.per_dp_bs_size, dtype=np.int32)),
-                    ]
-                )
-                cu_q_lens_sections.append(section_cu)
-            cu_q_lens = np.concatenate(cu_q_lens_sections)
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -190,41 +163,23 @@ class FlashAttention(AttentionBackend):
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
 
-        # Compute cu_kv_lens per DP rank section (each section starts from 0)
-        cu_kv_lens_sections = []
-        for i in range(0, len(aligned_seq_lens), batch.per_dp_bs_size):
-            section_lens = aligned_seq_lens[i : i + batch.per_dp_bs_size]
-            section_cu = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(section_lens, dtype=np.int32),
-                ]
-            )
-            cu_kv_lens_sections.append(section_cu)
-        cu_kv_lens = np.concatenate(cu_kv_lens_sections)
+        # cu_kv_lens per DP rank section — vectorized 2D cumsum
+        aligned_2d = aligned_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+        cu_kv_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+        cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
+        cu_kv_lens = cu_kv_2d.ravel()
 
-        distribution_list = []
-
-        # Iterate through each DP rank's section of the batch
-        for i in range(0, len(batch.seq_lens), batch.per_dp_bs_size):
-            section_seq_lens = batch.seq_lens[i : i + batch.per_dp_bs_size]
-
-            local_num_seqs = np.sum(section_seq_lens > 0, dtype=np.int32)
-
-            if batch.forward_mode == ForwardMode.DECODE:
-                # For Decode, we use the mixed/generic path: [0, 0, local_num_seqs]
-                dist = np.array([0, 0, local_num_seqs], dtype=np.int32)
-            elif batch.forward_mode == ForwardMode.EXTEND:
-                # For Extend/Prefill: [0, local_num_seqs, local_num_seqs]
-                dist = np.array([0, local_num_seqs, local_num_seqs], dtype=np.int32)
-            else:
-                raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
-
-            distribution_list.append(dist)
-
-        # Stack them to create a (dp_size, 3) array
-        # This allows JAX to shard it along axis 0, so each device gets its own (3,) distribution
-        distribution = np.concatenate(distribution_list)
+        # distribution — vectorized
+        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+        local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
+        if batch.forward_mode == ForwardMode.DECODE:
+            distribution = np.repeat(local_num_seqs, 3)
+        elif batch.forward_mode == ForwardMode.EXTEND:
+            distribution = np.column_stack(
+                [np.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs]
+            ).ravel()
+        else:
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
         (
             metadata.cu_q_lens,
@@ -235,7 +190,7 @@ class FlashAttention(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P("data")) if jax.process_count() == 1 else None),
+            sharding=(NamedSharding(self.mesh, P("data"))),
         )
         return metadata
 
@@ -348,7 +303,7 @@ class FlashAttention(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P("data")) if jax.process_count() == 1 else None),
+            sharding=(NamedSharding(self.mesh, P("data"))),
         )
         return metadata
 
@@ -458,9 +413,7 @@ class FlashAttention(AttentionBackend):
                     seq_lens_list[i],
                     distribution,
                 ),
-                sharding=(
-                    NamedSharding(self.mesh, P("data")) if jax.process_count() == 1 else None
-                ),
+                sharding=(NamedSharding(self.mesh, P("data"))),
             )
             metadata.append(metadata_tmp)
         return metadata
@@ -473,6 +426,9 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "kv_partition_axis": self.kv_partition_axis,
+            "attention_data_partition_axis": self.attention_data_partition_axis,
+            "mesh": self.mesh,
         }
         return (children, aux_data)
 
@@ -484,6 +440,9 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
+            kv_partition_axis=aux_data.get("kv_partition_axis", "tensor"),
+            attention_data_partition_axis=aux_data.get("attention_data_partition_axis", "data"),
+            mesh=aux_data.get("mesh"),
         )
 
         obj.forward_metadata = children[0]
@@ -527,16 +486,11 @@ class FlashAttention(AttentionBackend):
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
-        if self.forward_metadata.swa_page_indices is not None and hasattr(
-            token_to_kv_pool, "layers_mapping"
-        ):
-            _, is_swa = token_to_kv_pool.layers_mapping[layer.layer_id]
-            if is_swa:
-                page_indices_arg = self.forward_metadata.swa_page_indices
+        is_swa_layer = layer.sliding_window_size is not None and layer.sliding_window_size > 0
+        if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
+            page_indices_arg = self.forward_metadata.swa_page_indices
         elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
-
-        decode_mode = 1 if forward_batch.forward_mode == ForwardMode.DECODE else 0
 
         in_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # queries
@@ -544,7 +498,7 @@ class FlashAttention(AttentionBackend):
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # values (new tokens)
             P(
                 self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
-            ),  # kv_cache_fused 5D (head interleaved)
+            ),  # kv_cache_fused (head interleaved)
             P(self.attention_data_partition_axis),  # kv_lens
             P(self.attention_data_partition_axis),  # page_indices
             P(self.attention_data_partition_axis),  # cu_q_lens
@@ -560,7 +514,7 @@ class FlashAttention(AttentionBackend):
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # attention output
             P(
                 self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
-            ),  # updated kv_cache_fused (head interleaved) - 5D
+            ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
         def _ragged_paged_attention_with_fused_kv(*args):
@@ -575,13 +529,13 @@ class FlashAttention(AttentionBackend):
                 kv_cache_fused,
                 *other_args,
                 causal=causal,
-                decode_mode=decode_mode,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
+                vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
             return result, updated_kv_cache_fused
