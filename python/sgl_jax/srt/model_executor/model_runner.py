@@ -561,6 +561,7 @@ class ModelRunner(BaseModelRunner):
                 page_size=self.page_size,
                 swa_head_num=swa_head_num,
                 mesh=self.mesh,
+                dp_size=dp_size,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
