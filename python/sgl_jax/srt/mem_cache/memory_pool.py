@@ -331,8 +331,11 @@ class MHATokenToKVPool(KVCache):
 
         # Hack: this shape is more friendly to rpav3
         packing = get_dtype_packing(self.dtype)
+        total_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        # Round up to nearest multiple of dp_size so dim 0 is shardable across DP ranks
+        total_pages = ((total_pages + self.dp_size - 1) // self.dp_size) * self.dp_size
         fused_buffer_shape = (
-            (self.size + self.page_size * self.dp_size) // self.page_size,
+            total_pages,
             self.page_size,
             self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
             packing,
